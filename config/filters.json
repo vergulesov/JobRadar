@@ -1,0 +1,23 @@
+{
+  "reject_title_contains": [
+    "риэлтор",
+    "агент по недвижимости",
+    "кредитный специалист",
+    "страховой агент",
+    "оператор call-центра",
+    "оператор колл-центра",
+    "продавец-консультант",
+    "кассир",
+    "курьер",
+    "торговый представитель"
+  ],
+  "reject_text_contains": [
+    "без оклада",
+    "только процент",
+    "только %",
+    "оплата только за результат",
+    "сетевой маркетинг",
+    "mlm"
+  ],
+  "notes": "Conservative pre-AI filter. Do not reject vacancies merely for mentioning active sales, new clients, calls, meetings, travel, or cold outreach. Those are soft signals for AI/human review, not hard exclusions."
+}
