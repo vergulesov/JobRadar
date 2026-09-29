@@ -190,17 +190,27 @@ def main() -> int:
     collected = []
     errors = []
     saturated_queries = []
+    query_stats = []
+    seen_ids: set[str] = set()
 
     for idx, query in enumerate(query_cfg["queries"], 1):
         print(f"[{idx}/{len(query_cfg['queries'])}] {query}")
         try:
             rows = [v for v in parse_rss(fetch_rss(query), query) if is_fresh(v.published_at, cutoff)]
+            new_ids = {v.vacancy_id for v in rows} - seen_ids
+            seen_ids.update(v.vacancy_id for v in rows)
             collected.extend(rows)
             saturated = len(rows) >= 20
             if saturated:
                 saturated_queries.append(query)
             marker = " [SATURATED]" if saturated else ""
-            print(f"  + {len(rows)} fresh RSS items{marker}")
+            query_stats.append({
+                "query": query,
+                "items": len(rows),
+                "new_unique": len(new_ids),
+                "saturated": saturated,
+            })
+            print(f"  + {len(rows)} fresh RSS items, {len(new_ids)} new unique{marker}")
         except Exception as e:
             print(f"  ! {type(e).__name__}: {e}", file=sys.stderr)
             errors.append({"query": query, "error": f"{type(e).__name__}: {e}"})
@@ -211,6 +221,8 @@ def main() -> int:
     rejected = [v for v in filtered if v.hard_filter_status == "reject"]
 
     write_json(DATA_DIR / "raw.json", unique)
+    with (DATA_DIR / "query_stats.json").open("w", encoding="utf-8") as f:
+        json.dump(sorted(query_stats, key=lambda x: x["new_unique"], reverse=True), f, ensure_ascii=False, indent=2)
     write_json(DATA_DIR / "target.json", target)
     write_csv(DATA_DIR / "target.csv", target)
     write_json(DATA_DIR / "rejected.json", rejected)
@@ -222,6 +234,7 @@ def main() -> int:
         "queries": len(query_cfg["queries"]),
         "rss_items": len(collected),
         "saturated_queries": saturated_queries,
+        "query_stats": query_stats,
         "unique": len(unique),
         "target": len(target),
         "rejected": len(rejected),
