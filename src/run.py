@@ -16,7 +16,7 @@ CONFIG_DIR = ROOT / "config"
 DATA_DIR = ROOT / "data"
 DATA_DIR.mkdir(exist_ok=True)
 
-HH_API_URL = "https://api.hh.ru/vacancies"
+HH_RSS_URL = "https://hh.ru/search/vacancy/rss"
 USER_AGENT = "JobRadar/0.2 (github.com/vergulesov/JobRadar)"
 PER_PAGE = 100
 
@@ -66,43 +66,60 @@ def format_salary(salary: dict | None) -> str | None:
     return " ".join(parts) or None
 
 
-def fetch_api_page(query: str, page: int) -> dict:
+def fetch_rss(query: str) -> bytes:
     params = {
         "text": query,
         "order_by": "publication_time",
-        "per_page": PER_PAGE,
-        "page": page,
-        "host": "hh.ru",
     }
-    url = HH_API_URL + "?" + urllib.parse.urlencode(params)
-    req = urllib.request.Request(url, headers={
-        "User-Agent": USER_AGENT,
-        "HH-User-Agent": USER_AGENT,
-        "Accept": "application/json",
-    })
+    url = HH_RSS_URL + "?" + urllib.parse.urlencode(params)
+    req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
     with urllib.request.urlopen(req, timeout=25) as r:
-        return json.loads(r.read().decode("utf-8"))
+        return r.read()
 
 
-def parse_api_item(item: dict, query: str) -> Vacancy:
-    snippet = item.get("snippet") or {}
-    summary = " ".join(filter(None, [
-        strip_html(snippet.get("requirement")),
-        strip_html(snippet.get("responsibility")),
-    ])).strip()
-    employer = item.get("employer") or {}
-    area = item.get("area") or {}
-    return Vacancy(
-        vacancy_id=str(item.get("id") or ""),
-        title=item.get("name") or "",
-        company=employer.get("name"),
-        salary=format_salary(item.get("salary")),
-        location=area.get("name"),
-        published_at=item.get("published_at"),
-        url=item.get("alternate_url") or item.get("url") or "",
-        summary=summary,
-        matched_queries=[query],
-    )
+def text_of(node, name: str) -> str | None:
+    child = node.find(name)
+    if child is None or child.text is None:
+        return None
+    return strip_html(child.text)
+
+
+def extract_vacancy_id(url: str) -> str:
+    m = re.search(r"/vacancy/(\\d+)", url)
+    return m.group(1) if m else url
+
+
+def parse_rss(payload: bytes, query: str) -> list[Vacancy]:
+    import xml.etree.ElementTree as ET
+    from email.utils import parsedate_to_datetime
+
+    root = ET.fromstring(payload)
+    out = []
+    for item in root.findall(".//item"):
+        title = text_of(item, "title") or ""
+        url = text_of(item, "link") or text_of(item, "guid") or ""
+        description = text_of(item, "description") or ""
+        pub_raw = text_of(item, "pubDate")
+        published_at = None
+        if pub_raw:
+            try:
+                published_at = parsedate_to_datetime(pub_raw).astimezone(timezone.utc).isoformat()
+            except Exception:
+                published_at = pub_raw
+        if url:
+            out.append(Vacancy(
+                vacancy_id=extract_vacancy_id(url),
+                title=title,
+                company=None,
+                salary=None,
+                location=None,
+                published_at=published_at,
+                url=url,
+                summary=description,
+                matched_queries=[query],
+                source="hh_rss",
+            ))
+    return out
 
 
 def is_fresh(published_at: str | None, cutoff: datetime) -> bool:
@@ -116,117 +133,29 @@ def is_fresh(published_at: str | None, cutoff: datetime) -> bool:
     except Exception:
         return True
 
-
-def deduplicate(items: list[Vacancy]) -> list[Vacancy]:
-    by_id: dict[str, Vacancy] = {}
-    for v in items:
-        if not v.vacancy_id:
-            continue
-        if v.vacancy_id not in by_id:
-            by_id[v.vacancy_id] = v
-        else:
-            existing = by_id[v.vacancy_id]
-            for q in v.matched_queries:
-                if q not in existing.matched_queries:
-                    existing.matched_queries.append(q)
-            existing.company = existing.company or v.company
-            existing.salary = existing.salary or v.salary
-            existing.location = existing.location or v.location
-            if len(v.summary) > len(existing.summary):
-                existing.summary = v.summary
-    return list(by_id.values())
-
-
-def hard_filter(v: Vacancy, cfg: dict) -> Vacancy:
-    title = v.title.lower()
-    haystack = " ".join([
-        v.title or "", v.company or "", v.salary or "", v.location or "", v.summary or ""
-    ]).lower()
-
-    for token in cfg.get("reject_title_contains", []):
-        if token.lower() in title:
-            v.hard_filter_status = "reject"
-            v.hard_filter_reason = f"title contains: {token}"
-            return v
-
-    for token in cfg.get("reject_text_contains", []):
-        if token.lower() in haystack:
-            v.hard_filter_status = "reject"
-            v.hard_filter_reason = f"text contains: {token}"
-            return v
-
-    return v
-
-
-def write_json(path: Path, rows: list[Vacancy]):
-    with path.open("w", encoding="utf-8") as f:
-        json.dump([asdict(v) for v in rows], f, ensure_ascii=False, indent=2)
-
-
-def write_csv(path: Path, rows: list[Vacancy]):
-    fields = [
-        "vacancy_id", "title", "company", "salary", "location", "published_at",
-        "url", "summary", "matched_queries", "source", "hard_filter_status", "hard_filter_reason"
-    ]
-    with path.open("w", encoding="utf-8-sig", newline="") as f:
-        w = csv.DictWriter(f, fieldnames=fields)
-        w.writeheader()
-        for v in rows:
-            row = asdict(v)
-            row["matched_queries"] = " | ".join(v.matched_queries)
-            w.writerow(row)
-
-
 def main() -> int:
     query_cfg = load_json(CONFIG_DIR / "queries.json")
     filter_cfg = load_json(CONFIG_DIR / "filters.json")
     fresh_days = int(query_cfg.get("fresh_days", 7))
     cutoff = datetime.now(timezone.utc) - timedelta(days=fresh_days)
 
-    collected: list[Vacancy] = []
-    errors: list[dict] = []
-    api_requests = 0
-    total_found_by_queries = 0
+    collected = []
+    errors = []
+    saturated_queries = []
 
     for idx, query in enumerate(query_cfg["queries"], 1):
         print(f"[{idx}/{len(query_cfg['queries'])}] {query}")
-        query_rows: list[Vacancy] = []
-        page = 0
-        found = None
-
         try:
-            while True:
-                payload = fetch_api_page(query, page)
-                api_requests += 1
-                if found is None:
-                    found = int(payload.get("found", 0))
-                    total_found_by_queries += found
-                    print(f"  found by HH: {found}")
-
-                items = payload.get("items") or []
-                if not items:
-                    break
-
-                parsed = [parse_api_item(item, query) for item in items]
-                fresh = [v for v in parsed if is_fresh(v.published_at, cutoff)]
-                query_rows.extend(fresh)
-
-                pages = int(payload.get("pages", 1))
-                oldest_is_stale = any(not is_fresh(v.published_at, cutoff) for v in parsed)
-
-                # Sorted newest first: once a page crosses the freshness cutoff,
-                # older pages cannot add useful vacancies.
-                if oldest_is_stale or page + 1 >= pages:
-                    break
-
-                page += 1
-                time.sleep(0.08)
-
-            collected.extend(query_rows)
-            print(f"  + {len(query_rows)} fresh API items ({page + 1} page(s))")
+            rows = [v for v in parse_rss(fetch_rss(query), query) if is_fresh(v.published_at, cutoff)]
+            collected.extend(rows)
+            saturated = len(rows) >= 20
+            if saturated:
+                saturated_queries.append(query)
+            marker = " [SATURATED]" if saturated else ""
+            print(f"  + {len(rows)} fresh RSS items{marker}")
         except Exception as e:
             print(f"  ! {type(e).__name__}: {e}", file=sys.stderr)
-            errors.append({"query": query, "page": page, "error": f"{type(e).__name__}: {e}"})
+            errors.append({"query": query, "error": f"{type(e).__name__}: {e}"})
 
     unique = deduplicate(collected)
     filtered = [hard_filter(v, filter_cfg) for v in unique]
@@ -240,12 +169,11 @@ def main() -> int:
 
     meta = {
         "generated_at": datetime.now(timezone.utc).isoformat(),
-        "collector": "hh_api_list",
+        "collector": "hh_rss_broad_sweep",
         "fresh_days": fresh_days,
         "queries": len(query_cfg["queries"]),
-        "api_requests": api_requests,
-        "total_found_by_queries_before_dedup": total_found_by_queries,
-        "fresh_items_before_dedup": len(collected),
+        "rss_items": len(collected),
+        "saturated_queries": saturated_queries,
         "unique": len(unique),
         "target": len(target),
         "rejected": len(rejected),
@@ -257,10 +185,10 @@ def main() -> int:
     with (DATA_DIR / "run_meta.json").open("w", encoding="utf-8") as f:
         json.dump(meta, f, ensure_ascii=False, indent=2)
 
-    print("\nDONE")
+    print("\\nDONE")
     print(json.dumps(meta, ensure_ascii=False, indent=2))
+    if saturated_queries:
+        print(f"\\nWARNING: {len(saturated_queries)} RSS queries hit the 20-item ceiling.")
+        print("Coverage is expanded by overlapping narrow queries; saturated queries remain visible in run_meta.json.")
     return 0 if not errors else 2
 
-
-if __name__ == "__main__":
-    raise SystemExit(main())
