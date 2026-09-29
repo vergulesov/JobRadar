@@ -133,6 +133,54 @@ def is_fresh(published_at: str | None, cutoff: datetime) -> bool:
     except Exception:
         return True
 
+def deduplicate(items: list[Vacancy]) -> list[Vacancy]:
+    by_id: dict[str, Vacancy] = {}
+    for v in items:
+        if v.vacancy_id not in by_id:
+            by_id[v.vacancy_id] = v
+        else:
+            existing = by_id[v.vacancy_id]
+            for q in v.matched_queries:
+                if q not in existing.matched_queries:
+                    existing.matched_queries.append(q)
+            if len(v.summary) > len(existing.summary):
+                existing.summary = v.summary
+    return list(by_id.values())
+
+
+def hard_filter(v: Vacancy, cfg: dict) -> Vacancy:
+    title = v.title.lower()
+    haystack = " ".join([v.title or "", v.company or "", v.salary or "", v.location or "", v.summary or ""]).lower()
+    for token in cfg.get("reject_title_contains", []):
+        if token.lower() in title:
+            v.hard_filter_status = "reject"
+            v.hard_filter_reason = f"title contains: {token}"
+            return v
+    for token in cfg.get("reject_text_contains", []):
+        if token.lower() in haystack:
+            v.hard_filter_status = "reject"
+            v.hard_filter_reason = f"text contains: {token}"
+            return v
+    return v
+
+
+def write_json(path: Path, rows: list[Vacancy]):
+    with path.open("w", encoding="utf-8") as f:
+        json.dump([asdict(v) for v in rows], f, ensure_ascii=False, indent=2)
+
+
+def write_csv(path: Path, rows: list[Vacancy]):
+    fields = ["vacancy_id", "title", "company", "salary", "location", "published_at",
+              "url", "summary", "matched_queries", "source", "hard_filter_status", "hard_filter_reason"]
+    with path.open("w", encoding="utf-8-sig", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=fields)
+        w.writeheader()
+        for v in rows:
+            row = asdict(v)
+            row["matched_queries"] = " | ".join(v.matched_queries)
+            w.writerow(row)
+
+
 def main() -> int:
     query_cfg = load_json(CONFIG_DIR / "queries.json")
     filter_cfg = load_json(CONFIG_DIR / "filters.json")
