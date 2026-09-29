@@ -192,3 +192,7 @@ def main() -> int:
         print("Coverage is expanded by overlapping narrow queries; saturated queries remain visible in run_meta.json.")
     return 0 if not errors else 2
 
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
